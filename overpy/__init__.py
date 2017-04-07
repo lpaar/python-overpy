@@ -1,9 +1,11 @@
 from collections import OrderedDict
+from datetime import datetime
 from decimal import Decimal
 from xml.sax import handler, make_parser
 import json
 import re
 import sys
+import time
 
 from overpy import exception
 from overpy.__about__ import (
@@ -11,12 +13,21 @@ from overpy.__about__ import (
     __uri__, __version__
 )
 
-
 PY2 = sys.version_info[0] == 2
 PY3 = sys.version_info[0] == 3
 
 XML_PARSER_DOM = 1
 XML_PARSER_SAX = 2
+
+# Try to convert some common attributes
+# http://wiki.openstreetmap.org/wiki/Elements#Common_attributes
+GLOBAL_ATTRIBUTE_MODIFIERS = {
+    "changeset": int,
+    "timestamp": lambda ts: datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ"),
+    "uid": int,
+    "version": int,
+    "visible": lambda v: v.lower() == "true"
+}
 
 if PY2:
     from urllib2 import urlopen
@@ -39,26 +50,65 @@ def is_valid_type(element, cls):
 
 
 class Overpass(object):
-
     """
     Class to access the Overpass API
-    """
-    default_read_chunk_size = 4096
 
-    def __init__(self, read_chunk_size=None, xml_parser=XML_PARSER_SAX):
+    :cvar default_max_retry_count: Global max number of retries (Default: 0)
+    :cvar default_retry_timeout: Global time to wait between tries (Default: 1.0s)
+    """
+    default_max_retry_count = 0
+    default_read_chunk_size = 4096
+    default_retry_timeout = 1.0
+    default_url = "http://overpass-api.de/api/interpreter"
+
+    def __init__(self, read_chunk_size=None, url=None, xml_parser=XML_PARSER_SAX, max_retry_count=None, retry_timeout=None):
         """
         :param read_chunk_size: Max size of each chunk read from the server response
         :type read_chunk_size: Integer
+        :param url: Optional URL of the Overpass server. Defaults to http://overpass-api.de/api/interpreter
+        :type url: str
         :param xml_parser: The xml parser to use
         :type xml_parser: Integer
+        :param max_retry_count: Max number of retries (Default: default_max_retry_count)
+        :type max_retry_count: Integer
+        :param retry_timeout: Time to wait between tries (Default: default_retry_timeout)
+        :type retry_timeout: float
         """
-        self.url = "http://overpass-api.de/api/interpreter"
+        self.url = self.default_url
+        if url is not None:
+            self.url = url
+
         self._regex_extract_error_msg = re.compile(b"\<p\>(?P<msg>\<strong\s.*?)\</p\>")
         self._regex_remove_tag = re.compile(b"<[^>]*?>")
         if read_chunk_size is None:
             read_chunk_size = self.default_read_chunk_size
         self.read_chunk_size = read_chunk_size
+
+        if max_retry_count is None:
+            max_retry_count = self.default_max_retry_count
+        self.max_retry_count = max_retry_count
+
+        if retry_timeout is None:
+            retry_timeout = self.default_retry_timeout
+        self.retry_timeout = retry_timeout
+
         self.xml_parser = xml_parser
+
+    def _handle_remark_msg(self, msg):
+        """
+        Try to parse the message provided with the remark tag or element.
+
+        :param str msg: The message
+        :raises overpy.exception.OverpassRuntimeError: If message starts with 'runtime error:'
+        :raises overpy.exception.OverpassRuntimeRemark: If message starts with 'runtime remark:'
+        :raises overpy.exception.OverpassUnknownError: If we are unable to identify the error
+        """
+        msg = msg.strip()
+        if msg.startswith("runtime error:"):
+            raise exception.OverpassRuntimeError(msg=msg)
+        elif msg.startswith("runtime remark:"):
+            raise exception.OverpassRuntimeRemark(msg=msg)
+        raise exception.OverpassUnknownError(msg=msg)
 
     def query(self, query):
         """
@@ -69,58 +119,87 @@ class Overpass(object):
         :rtype: overpy.Result
         """
         if not isinstance(query, bytes):
-            query = bytes(query, "utf-8")
+            query = query.encode("utf-8")
 
-        try:
-            f = urlopen(self.url, query)
-        except HTTPError as e:
-            f = e
+        retry_num = 0
+        retry_exceptions = []
+        do_retry = True if self.max_retry_count > 0 else False
+        while retry_num <= self.max_retry_count:
+            if retry_num > 0:
+                time.sleep(self.retry_timeout)
+            retry_num += 1
+            try:
+                f = urlopen(self.url, query)
+            except HTTPError as e:
+                f = e
 
-        response = f.read(self.read_chunk_size)
-        while True:
-            data = f.read(self.read_chunk_size)
-            if len(data) == 0:
-                break
-            response = response + data
-        f.close()
+            response = f.read(self.read_chunk_size)
+            while True:
+                data = f.read(self.read_chunk_size)
+                if len(data) == 0:
+                    break
+                response = response + data
+            f.close()
 
-        if f.code == 200:
-            if PY2:
-                http_info = f.info()
-                content_type = http_info.getheader("content-type")
-            else:
-                content_type = f.getheader("Content-Type")
+            if f.code == 200:
+                if PY2:
+                    http_info = f.info()
+                    content_type = http_info.getheader("content-type")
+                else:
+                    content_type = f.getheader("Content-Type")
 
-            if content_type == "application/json":
-                return self.parse_json(response)
+                if content_type == "application/json":
+                    return self.parse_json(response)
 
-            if content_type == "application/osm3s+xml":
-                return self.parse_xml(response)
+                if content_type == "application/osm3s+xml":
+                    return self.parse_xml(response)
 
-            raise exception.OverpassUnknownContentType(content_type)
+                e = exception.OverpassUnknownContentType(content_type)
+                if not do_retry:
+                    raise e
+                retry_exceptions.append(e)
+                continue
 
-        if f.code == 400:
-            msgs = []
-            for msg in self._regex_extract_error_msg.finditer(response):
-                tmp = self._regex_remove_tag.sub(b"", msg.group("msg"))
-                try:
-                    tmp = tmp.decode("utf-8")
-                except UnicodeDecodeError:
-                    tmp = repr(tmp)
-                msgs.append(tmp)
+            if f.code == 400:
+                msgs = []
+                for msg in self._regex_extract_error_msg.finditer(response):
+                    tmp = self._regex_remove_tag.sub(b"", msg.group("msg"))
+                    try:
+                        tmp = tmp.decode("utf-8")
+                    except UnicodeDecodeError:
+                        tmp = repr(tmp)
+                    msgs.append(tmp)
 
-            raise exception.OverpassBadRequest(
-                query,
-                msgs=msgs
-            )
+                e = exception.OverpassBadRequest(
+                    query,
+                    msgs=msgs
+                )
+                if not do_retry:
+                    raise e
+                retry_exceptions.append(e)
+                continue
 
-        if f.code == 429:
-            raise exception.OverpassTooManyRequests
+            if f.code == 429:
+                e = exception.OverpassTooManyRequests
+                if not do_retry:
+                    raise e
+                retry_exceptions.append(e)
+                continue
 
-        if f.code == 504:
-            raise exception.OverpassGatewayTimeout
+            if f.code == 504:
+                e = exception.OverpassGatewayTimeout
+                if not do_retry:
+                    raise e
+                retry_exceptions.append(e)
+                continue
 
-        raise exception.OverpassUnknownHTTPStatusCode(f.code)
+            e = exception.OverpassUnknownHTTPStatusCode(f.code)
+            if not do_retry:
+                raise e
+            retry_exceptions.append(e)
+            continue
+
+        raise exception.MaxRetriesReached(retry_count=retry_num, exceptions=retry_exceptions)
 
     def parse_json(self, data, encoding="utf-8"):
         """
@@ -136,6 +215,8 @@ class Overpass(object):
         if isinstance(data, bytes):
             data = data.decode(encoding)
         data = json.loads(data, parse_float=Decimal)
+        if "remark" in data:
+            self._handle_remark_msg(msg=data.get("remark"))
         return Result.from_json(data, api=self)
 
     def parse_xml(self, data, encoding="utf-8", parser=None):
@@ -157,11 +238,14 @@ class Overpass(object):
             # Python 2.x: Convert unicode strings
             data = data.encode(encoding)
 
+        m = re.compile("<remark>(?P<msg>[^<>]*)</remark>").search(data)
+        if m:
+            self._handle_remark_msg(m.group("msg"))
+
         return Result.from_xml(data, api=self, parser=parser)
 
 
 class Result(object):
-
     """
     Class to handle the result.
     """
@@ -175,11 +259,12 @@ class Result(object):
         """
         if elements is None:
             elements = []
+        self._areas = OrderedDict((element.id, element) for element in elements if is_valid_type(element, Area))
         self._nodes = OrderedDict((element.id, element) for element in elements if is_valid_type(element, Node))
         self._ways = OrderedDict((element.id, element) for element in elements if is_valid_type(element, Way))
         self._relations = OrderedDict((element.id, element)
                                       for element in elements if is_valid_type(element, Relation))
-        self._class_collection_map = {Node: self._nodes, Way: self._ways, Relation: self._relations}
+        self._class_collection_map = {Node: self._nodes, Way: self._ways, Relation: self._relations, Area: self._areas}
         self.api = api
 
     def expand(self, other):
@@ -195,7 +280,7 @@ class Result(object):
         if not isinstance(other, Result):
             raise ValueError("Provided argument has to be instance of overpy:Result()")
 
-        other_collection_map = {Node: other.nodes, Way: other.ways, Relation: other.relations}
+        other_collection_map = {Node: other.nodes, Way: other.ways, Relation: other.relations, Area: other.areas}
         for element_type, own_collection in self._class_collection_map.items():
             for element in other_collection_map[element_type]:
                 if is_valid_type(element, element_type) and element.id not in own_collection:
@@ -249,6 +334,9 @@ class Result(object):
     def get_relation_ids(self):
         return self.get_ids(filter_cls=Relation)
 
+    def get_area_ids(self):
+        return self.get_ids(filter_cls=Area)
+
     @classmethod
     def from_json(cls, data, api=None):
         """
@@ -262,7 +350,7 @@ class Result(object):
         :rtype: overpy.Result
         """
         result = cls(api=api)
-        for elem_cls in [Node, Way, Relation]:
+        for elem_cls in [Node, Way, Relation, Area]:
             for element in data.get("elements", []):
                 e_type = element.get("type")
                 if hasattr(e_type, "lower") and e_type.lower() == elem_cls._type_value:
@@ -271,25 +359,41 @@ class Result(object):
         return result
 
     @classmethod
-    def from_xml(cls, data, api=None, parser=XML_PARSER_SAX):
+    def from_xml(cls, data, api=None, parser=None):
         """
-        Create a new instance and load data from xml object.
+        Create a new instance and load data from xml data or object.
+        
+        .. note::
+            If parser is set to None, the functions tries to find the best parse.
+            By default the SAX parser is chosen if a string is provided as data.
+            The parser is set to DOM if an xml.etree.ElementTree.Element is provided as data value.
 
         :param data: Root element
-        :type data: xml.etree.ElementTree.Element
-        :param api:
+        :type data: str | xml.etree.ElementTree.Element
+        :param api: The instance to query additional information if required.
         :type api: Overpass
-        :param parser: Specify the parser to use(DOM or SAX)
-        :type parser: Integer
+        :param parser: Specify the parser to use(DOM or SAX)(Default: None = autodetect, defaults to SAX)
+        :type parser: Integer | None
         :return: New instance of Result object
         :rtype: Result
         """
+        if parser is None:
+            if isinstance(data, str):
+                parser = XML_PARSER_SAX
+            else:
+                parser = XML_PARSER_DOM
+
         result = cls(api=api)
         if parser == XML_PARSER_DOM:
             import xml.etree.ElementTree as ET
-            root = ET.fromstring(data)
+            if isinstance(data, str):
+                root = ET.fromstring(data)
+            elif isinstance(data, ET.Element):
+                root = data
+            else:
+                raise exception.OverPyException("Unable to detect data type.")
 
-            for elem_cls in [Node, Way, Relation]:
+            for elem_cls in [Node, Way, Relation, Area]:
                 for child in root:
                     if child.tag.lower() == elem_cls._type_value:
                         result.append(elem_cls.from_xml(child, result=result))
@@ -308,6 +412,51 @@ class Result(object):
             # ToDo: better exception
             raise Exception("Unknown XML parser")
         return result
+
+    def get_area(self, area_id, resolve_missing=False):
+        """
+        Get an area by its ID.
+
+        :param area_id: The area ID
+        :type area_id: Integer
+        :param resolve_missing: Query the Overpass API if the area is missing in the result set.
+        :return: The area
+        :rtype: overpy.Area
+        :raises overpy.exception.DataIncomplete: The requested way is not available in the result cache.
+        :raises overpy.exception.DataIncomplete: If resolve_missing is True and the area can't be resolved.
+        """
+        areas = self.get_areas(area_id=area_id)
+        if len(areas) == 0:
+            if resolve_missing is False:
+                raise exception.DataIncomplete("Resolve missing area is disabled")
+
+            query = ("\n"
+                     "[out:json];\n"
+                     "area({area_id});\n"
+                     "out body;\n"
+                     )
+            query = query.format(
+                area_id=area_id
+            )
+            tmp_result = self.api.query(query)
+            self.expand(tmp_result)
+
+            areas = self.get_areas(area_id=area_id)
+
+        if len(areas) == 0:
+            raise exception.DataIncomplete("Unable to resolve requested areas")
+
+        return areas[0]
+
+    def get_areas(self, area_id=None, **kwargs):
+        """
+        Alias for get_elements() but filter the result by Area
+
+        :param area_id: The Id of the area
+        :type area_id: Integer
+        :return: List of elements
+        """
+        return self.get_elements(Area, elem_id=area_id, **kwargs)
 
     def get_node(self, node_id, resolve_missing=False):
         """
@@ -444,6 +593,8 @@ class Result(object):
         """
         return self.get_elements(Way, elem_id=way_id, **kwargs)
 
+    area_ids = property(get_area_ids)
+    areas = property(get_areas)
     node_ids = property(get_node_ids)
     nodes = property(get_nodes)
     relation_ids = property(get_relation_ids)
@@ -453,7 +604,6 @@ class Result(object):
 
 
 class Element(object):
-
     """
     Base element
     """
@@ -469,12 +619,146 @@ class Element(object):
 
         self._result = result
         self.attributes = attributes
+        # ToDo: Add option to modify attribute modifiers
+        attribute_modifiers = dict(GLOBAL_ATTRIBUTE_MODIFIERS.items())
+        for n, m in attribute_modifiers.items():
+            if n in self.attributes:
+                self.attributes[n] = m(self.attributes[n])
         self.id = None
         self.tags = tags
 
+    @classmethod
+    def get_center_from_json(cls, data):
+        """
+        Get center information from json data
+
+        :param data: json data
+        :return: tuple with two elements: lat and lon
+        :rtype: tuple
+        """
+        center_lat = None
+        center_lon = None
+        center = data.get("center")
+        if isinstance(center, dict):
+            center_lat = center.get("lat")
+            center_lon = center.get("lon")
+            if center_lat is None or center_lon is None:
+                raise ValueError("Unable to get lat or lon of way center.")
+            center_lat = Decimal(center_lat)
+            center_lon = Decimal(center_lon)
+        return (center_lat, center_lon)
+
+    @classmethod
+    def get_center_from_xml_dom(cls, sub_child):
+        center_lat = sub_child.attrib.get("lat")
+        center_lon = sub_child.attrib.get("lon")
+        if center_lat is None or center_lon is None:
+            raise ValueError("Unable to get lat or lon of way center.")
+        center_lat = Decimal(center_lat)
+        center_lon = Decimal(center_lon)
+        return center_lat, center_lon
+
+
+class Area(Element):
+    """
+    Class to represent an element of type area
+    """
+
+    _type_value = "area"
+
+    def __init__(self, area_id=None, **kwargs):
+        """
+        :param area_id: Id of the area element
+        :type area_id: Integer
+        :param kwargs: Additional arguments are passed directly to the parent class
+
+        """
+
+        Element.__init__(self, **kwargs)
+        #: The id of the way
+        self.id = area_id
+
+    def __repr__(self):
+        return "<overpy.Area id={}>".format(self.id)
+
+    @classmethod
+    def from_json(cls, data, result=None):
+        """
+        Create new Area element from JSON data
+
+        :param data: Element data from JSON
+        :type data: Dict
+        :param result: The result this element belongs to
+        :type result: overpy.Result
+        :return: New instance of Way
+        :rtype: overpy.Area
+        :raises overpy.exception.ElementDataWrongType: If type value of the passed JSON data does not match.
+        """
+        if data.get("type") != cls._type_value:
+            raise exception.ElementDataWrongType(
+                type_expected=cls._type_value,
+                type_provided=data.get("type")
+            )
+
+        tags = data.get("tags", {})
+
+        area_id = data.get("id")
+
+        attributes = {}
+        ignore = ["id", "tags", "type"]
+        for n, v in data.items():
+            if n in ignore:
+                continue
+            attributes[n] = v
+
+        return cls(area_id=area_id, attributes=attributes, tags=tags, result=result)
+
+    @classmethod
+    def from_xml(cls, child, result=None):
+        """
+        Create new way element from XML data
+
+        :param child: XML node to be parsed
+        :type child: xml.etree.ElementTree.Element
+        :param result: The result this node belongs to
+        :type result: overpy.Result
+        :return: New Way oject
+        :rtype: overpy.Way
+        :raises overpy.exception.ElementDataWrongType: If name of the xml child node doesn't match
+        :raises ValueError: If the ref attribute of the xml node is not provided
+        :raises ValueError: If a tag doesn't have a name
+        """
+        if child.tag.lower() != cls._type_value:
+            raise exception.ElementDataWrongType(
+                type_expected=cls._type_value,
+                type_provided=child.tag.lower()
+            )
+
+        tags = {}
+
+        for sub_child in child:
+            if sub_child.tag.lower() == "tag":
+                name = sub_child.attrib.get("k")
+                if name is None:
+                    raise ValueError("Tag without name/key.")
+                value = sub_child.attrib.get("v")
+                tags[name] = value
+
+        area_id = child.attrib.get("id")
+        if area_id is not None:
+            area_id = int(area_id)
+
+        attributes = {}
+        ignore = ["id"]
+        for n, v in child.attrib.items():
+            if n in ignore:
+                continue
+            attributes[n] = v
+
+        return cls(area_id=area_id, attributes=attributes, tags=tags, result=result)
+
 
 class Node(Element):
-
     """
     Class to represent an element of type node
     """
@@ -585,14 +869,13 @@ class Node(Element):
 
 
 class Way(Element):
-
     """
     Class to represent an element of type way
     """
 
     _type_value = "way"
 
-    def __init__(self, way_id=None, node_ids=None, **kwargs):
+    def __init__(self, way_id=None, center_lat=None, center_lon=None, node_ids=None, **kwargs):
         """
         :param node_ids: List of node IDs
         :type node_ids: List or Tuple
@@ -608,6 +891,10 @@ class Way(Element):
 
         #: List of Ids of the associated nodes
         self._node_ids = node_ids
+
+        #: The lat/lon of the center of the way (optional depending on query)
+        self.center_lat = center_lat
+        self.center_lon = center_lon
 
     def __repr__(self):
         return "<overpy.Way id={} nodes={}>".format(self.id, self._node_ids)
@@ -698,15 +985,24 @@ class Way(Element):
 
         way_id = data.get("id")
         node_ids = data.get("nodes")
+        (center_lat, center_lon) = cls.get_center_from_json(data=data)
 
         attributes = {}
-        ignore = ["id", "nodes", "tags", "type"]
+        ignore = ["center", "id", "nodes", "tags", "type"]
         for n, v in data.items():
             if n in ignore:
                 continue
             attributes[n] = v
 
-        return cls(way_id=way_id, attributes=attributes, node_ids=node_ids, tags=tags, result=result)
+        return cls(
+            attributes=attributes,
+            center_lat=center_lat,
+            center_lon=center_lon,
+            node_ids=node_ids,
+            tags=tags,
+            result=result,
+            way_id=way_id
+        )
 
     @classmethod
     def from_xml(cls, child, result=None):
@@ -731,6 +1027,8 @@ class Way(Element):
 
         tags = {}
         node_ids = []
+        center_lat = None
+        center_lon = None
 
         for sub_child in child:
             if sub_child.tag.lower() == "tag":
@@ -745,6 +1043,8 @@ class Way(Element):
                     raise ValueError("Unable to find required ref value.")
                 ref_id = int(ref_id)
                 node_ids.append(ref_id)
+            if sub_child.tag.lower() == "center":
+                (center_lat, center_lon) = cls.get_center_from_xml_dom(sub_child=sub_child)
 
         way_id = child.attrib.get("id")
         if way_id is not None:
@@ -757,18 +1057,18 @@ class Way(Element):
                 continue
             attributes[n] = v
 
-        return cls(way_id=way_id, attributes=attributes, node_ids=node_ids, tags=tags, result=result)
+        return cls(way_id=way_id, center_lat=center_lat, center_lon=center_lon,
+                   attributes=attributes, node_ids=node_ids, tags=tags, result=result)
 
 
 class Relation(Element):
-
     """
     Class to represent an element of type relation
     """
 
     _type_value = "relation"
 
-    def __init__(self, rel_id=None, members=None, **kwargs):
+    def __init__(self, rel_id=None, center_lat=None, center_lon=None, members=None, **kwargs):
         """
         :param members:
         :param rel_id: Id of the relation element
@@ -780,6 +1080,10 @@ class Relation(Element):
         Element.__init__(self, **kwargs)
         self.id = rel_id
         self.members = members
+
+        #: The lat/lon of the center of the way (optional depending on query)
+        self.center_lat = center_lat
+        self.center_lon = center_lon
 
     def __repr__(self):
         return "<overpy.Relation id={}>".format(self.id)
@@ -806,6 +1110,7 @@ class Relation(Element):
         tags = data.get("tags", {})
 
         rel_id = data.get("id")
+        (center_lat, center_lon) = cls.get_center_from_json(data=data)
 
         members = []
 
@@ -828,7 +1133,15 @@ class Relation(Element):
                 continue
             attributes[n] = v
 
-        return cls(rel_id=rel_id, attributes=attributes, members=members, tags=tags, result=result)
+        return cls(
+            rel_id=rel_id,
+            attributes=attributes,
+            center_lat=center_lat,
+            center_lon=center_lon,
+            members=members,
+            tags=tags,
+            result=result
+        )
 
     @classmethod
     def from_xml(cls, child, result=None):
@@ -852,8 +1165,10 @@ class Relation(Element):
 
         tags = {}
         members = []
+        center_lat = None
+        center_lon = None
 
-        supported_members = [RelationNode, RelationWay, RelationRelation]
+        supported_members = [RelationNode, RelationWay, RelationRelation, RelationArea]
         for sub_child in child:
             if sub_child.tag.lower() == "tag":
                 name = sub_child.attrib.get("k")
@@ -871,6 +1186,8 @@ class Relation(Element):
                                 result=result
                             )
                         )
+            if sub_child.tag.lower() == "center":
+                (center_lat, center_lon) = cls.get_center_from_xml_dom(sub_child=sub_child)
 
         rel_id = child.attrib.get("id")
         if rel_id is not None:
@@ -883,16 +1200,23 @@ class Relation(Element):
                 continue
             attributes[n] = v
 
-        return cls(rel_id=rel_id, attributes=attributes, members=members, tags=tags, result=result)
+        return cls(
+            rel_id=rel_id,
+            attributes=attributes,
+            center_lat=center_lat,
+            center_lon=center_lon,
+            members=members,
+            tags=tags,
+            result=result
+        )
 
 
 class RelationMember(object):
-
     """
     Base class to represent a member of a relation.
     """
 
-    def __init__(self, ref=None, role=None, result=None):
+    def __init__(self, attributes=None, geometry=None, ref=None, role=None, result=None):
         """
         :param ref: Reference Id
         :type ref: Integer
@@ -903,6 +1227,8 @@ class RelationMember(object):
         self.ref = ref
         self._result = result
         self.role = role
+        self.attributes = attributes
+        self.geometry = geometry
 
     @classmethod
     def from_json(cls, data, result=None):
@@ -925,7 +1251,35 @@ class RelationMember(object):
 
         ref = data.get("ref")
         role = data.get("role")
-        return cls(ref=ref, role=role, result=result)
+
+        attributes = {}
+        ignore = ["geometry", "type", "ref", "role"]
+        for n, v in data.items():
+            if n in ignore:
+                continue
+            attributes[n] = v
+
+        geometry = data.get("geometry")
+        if isinstance(geometry, list):
+            geometry_orig = geometry
+            geometry = []
+            for v in geometry_orig:
+                geometry.append(
+                    RelationWayGeometryValue(
+                        lat=v.get("lat"),
+                        lon=v.get("lon")
+                    )
+                )
+        else:
+            geometry = None
+
+        return cls(
+            attributes=attributes,
+            geometry=geometry,
+            ref=ref,
+            role=role,
+            result=result
+        )
 
     @classmethod
     def from_xml(cls, child, result=None):
@@ -950,7 +1304,33 @@ class RelationMember(object):
         if ref is not None:
             ref = int(ref)
         role = child.attrib.get("role")
-        return cls(ref=ref, role=role, result=result)
+
+        attributes = {}
+        ignore = ["geometry", "ref", "role", "type"]
+        for n, v in child.attrib.items():
+            if n in ignore:
+                continue
+            attributes[n] = v
+
+        geometry = None
+        for sub_child in child:
+            if sub_child.tag.lower() == "nd":
+                if geometry is None:
+                    geometry = []
+                geometry.append(
+                    RelationWayGeometryValue(
+                        lat=Decimal(sub_child.attrib["lat"]),
+                        lon=Decimal(sub_child.attrib["lon"])
+                    )
+                )
+
+        return cls(
+            attributes=attributes,
+            geometry=geometry,
+            ref=ref,
+            role=role,
+            result=result
+        )
 
 
 class RelationNode(RelationMember):
@@ -973,6 +1353,15 @@ class RelationWay(RelationMember):
         return "<overpy.RelationWay ref={} role={}>".format(self.ref, self.role)
 
 
+class RelationWayGeometryValue(object):
+    def __init__(self, lat, lon):
+        self.lat = lat
+        self.lon = lon
+
+    def __repr__(self):
+        return "<overpy.RelationWayGeometryValue lat={} lon={}>".format(self.lat, self.lon)
+
+
 class RelationRelation(RelationMember):
     _type_value = "relation"
 
@@ -983,14 +1372,24 @@ class RelationRelation(RelationMember):
         return "<overpy.RelationRelation ref={} role={}>".format(self.ref, self.role)
 
 
+class RelationArea(RelationMember):
+    _type_value = "area"
+
+    def resolve(self, resolve_missing=False):
+        return self._result.get_area(self.ref, resolve_missing=resolve_missing)
+
+    def __repr__(self):
+        return "<overpy.RelationArea ref={} role={}>".format(self.ref, self.role)
+
+
 class OSMSAXHandler(handler.ContentHandler):
     """
     SAX parser for Overpass XML response.
     """
     #: Tuple of opening elements to ignore
-    ignore_start = ('osm', 'meta', 'note')
+    ignore_start = ('osm', 'meta', 'note', 'bounds', 'remark')
     #: Tuple of closing elements to ignore
-    ignore_end = ('osm', 'meta', 'note', 'tag', 'nd', 'member')
+    ignore_end = ('osm', 'meta', 'note', 'bounds', 'remark', 'tag', 'nd', 'center')
 
     def __init__(self, result):
         """
@@ -1000,6 +1399,8 @@ class OSMSAXHandler(handler.ContentHandler):
         handler.ContentHandler.__init__(self)
         self._result = result
         self._curr = {}
+        #: Current relation member object
+        self.cur_relation_member = None
 
     def startElement(self, name, attrs):
         """
@@ -1030,8 +1431,22 @@ class OSMSAXHandler(handler.ContentHandler):
         try:
             handler = getattr(self, '_handle_end_%s' % name)
         except AttributeError:
-            raise KeyError("Unknown element start '%s'" % name)
+            raise KeyError("Unknown element end '%s'" % name)
         handler()
+
+    def _handle_start_center(self, attrs):
+        """
+        Handle opening center element
+
+        :param attrs: Attributes of the element
+        :type attrs: Dict
+        """
+        center_lat = attrs.get("lat")
+        center_lon = attrs.get("lon")
+        if center_lat is None or center_lon is None:
+            raise ValueError("Unable to get lat or lon of way center.")
+        self._curr["center_lat"] = Decimal(center_lat)
+        self._curr["center_lon"] = Decimal(center_lon)
 
     def _handle_start_tag(self, attrs):
         """
@@ -1085,6 +1500,8 @@ class OSMSAXHandler(handler.ContentHandler):
         :type attrs: Dict
         """
         self._curr = {
+            'center_lat': None,
+            'center_lon': None,
             'attributes': dict(attrs),
             'node_ids': [],
             'tags': {},
@@ -1101,6 +1518,29 @@ class OSMSAXHandler(handler.ContentHandler):
         self._result.append(Way(result=self._result, **self._curr))
         self._curr = {}
 
+    def _handle_start_area(self, attrs):
+        """
+        Handle opening area element
+
+        :param attrs: Attributes of the element
+        :type attrs: Dict
+        """
+        self._curr = {
+            'attributes': dict(attrs),
+            'tags': {},
+            'area_id': None
+        }
+        if attrs.get('id', None) is not None:
+            self._curr['area_id'] = int(attrs['id'])
+            del self._curr['attributes']['id']
+
+    def _handle_end_area(self):
+        """
+        Handle closing area element
+        """
+        self._result.append(Area(result=self._result, **self._curr))
+        self._curr = {}
+
     def _handle_start_nd(self, attrs):
         """
         Handle opening nd element
@@ -1108,11 +1548,21 @@ class OSMSAXHandler(handler.ContentHandler):
         :param attrs: Attributes of the element
         :type attrs: Dict
         """
-        try:
-            node_ref = attrs['ref']
-        except KeyError:
-            raise ValueError("Unable to find required ref value.")
-        self._curr['node_ids'].append(int(node_ref))
+        if isinstance(self.cur_relation_member, RelationWay):
+            if self.cur_relation_member.geometry is None:
+                self.cur_relation_member.geometry = []
+            self.cur_relation_member.geometry.append(
+                RelationWayGeometryValue(
+                    lat=Decimal(attrs["lat"]),
+                    lon=Decimal(attrs["lon"])
+                )
+            )
+        else:
+            try:
+                node_ref = attrs['ref']
+            except KeyError:
+                raise ValueError("Unable to find required ref value.")
+            self._curr['node_ids'].append(int(node_ref))
 
     def _handle_start_relation(self, attrs):
         """
@@ -1145,7 +1595,10 @@ class OSMSAXHandler(handler.ContentHandler):
         :param attrs: Attributes of the element
         :type attrs: Dict
         """
+
         params = {
+            # ToDo: Parse attributes
+            'attributes': {},
             'ref': None,
             'result': self._result,
             'role': None
@@ -1155,11 +1608,18 @@ class OSMSAXHandler(handler.ContentHandler):
         if attrs.get('role', None):
             params['role'] = attrs['role']
 
-        if attrs['type'] == 'node':
-            self._curr['members'].append(RelationNode(**params))
-        elif attrs['type'] == 'way':
-            self._curr['members'].append(RelationWay(**params))
-        elif attrs['type'] == 'relation':
-            self._curr['members'].append(RelationRelation(**params))
-        else:
+        cls_map = {
+            "area": RelationArea,
+            "node": RelationNode,
+            "relation": RelationRelation,
+            "way": RelationWay
+        }
+        cls = cls_map.get(attrs["type"])
+        if cls is None:
             raise ValueError("Undefined type for member: '%s'" % attrs['type'])
+
+        self.cur_relation_member = cls(**params)
+        self._curr['members'].append(self.cur_relation_member)
+
+    def _handle_end_member(self):
+        self.cur_relation_member = None

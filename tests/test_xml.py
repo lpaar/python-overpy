@@ -2,8 +2,19 @@ import pytest
 
 import overpy
 
-from tests.base_class import BaseTestNodes, BaseTestRelation, BaseTestWay
+from tests.base_class import BaseTestAreas, BaseTestNodes, BaseTestRelation, BaseTestWay
 from tests.base_class import read_file
+
+
+class TestAreas(BaseTestAreas):
+    def test_node01(self):
+        api = overpy.Overpass()
+        # DOM
+        result = api.parse_xml(read_file("xml/area-01.xml"), parser=overpy.XML_PARSER_DOM)
+        self._test_area01(result)
+        # SAX
+        result = api.parse_xml(read_file("xml/area-01.xml"), parser=overpy.XML_PARSER_SAX)
+        self._test_area01(result)
 
 
 class TestNodes(BaseTestNodes):
@@ -36,6 +47,24 @@ class TestRelation(BaseTestRelation):
         result = api.parse_xml(read_file("xml/relation-02.xml"), parser=overpy.XML_PARSER_SAX)
         self._test_relation02(result)
 
+    def test_relation03(self):
+        api = overpy.Overpass()
+        # DOM
+        result = api.parse_xml(read_file("xml/relation-03.xml"), parser=overpy.XML_PARSER_DOM)
+        self._test_relation03(result)
+        # SAX
+        result = api.parse_xml(read_file("xml/relation-03.xml"), parser=overpy.XML_PARSER_SAX)
+        self._test_relation03(result)
+
+    def test_relation04(self):
+        api = overpy.Overpass()
+        # DOM
+        result = api.parse_xml(read_file("xml/relation-04.xml"), parser=overpy.XML_PARSER_DOM)
+        self._test_relation04(result)
+        # SAX
+        result = api.parse_xml(read_file("xml/relation-04.xml"), parser=overpy.XML_PARSER_SAX)
+        self._test_relation04(result)
+
 
 class TestWay(BaseTestWay):
     def test_way01(self):
@@ -55,6 +84,25 @@ class TestWay(BaseTestWay):
         # SAX
         result = api.parse_xml(read_file("xml/way-02.xml"), parser=overpy.XML_PARSER_SAX)
         self._test_way02(result)
+
+    def test_way03(self):
+        api = overpy.Overpass()
+        # DOM
+        result = api.parse_xml(read_file("xml/way-03.xml"), parser=overpy.XML_PARSER_DOM)
+        self._test_way03(result)
+        # SAX
+        result = api.parse_xml(read_file("xml/way-03.xml"), parser=overpy.XML_PARSER_SAX)
+        self._test_way03(result)
+
+    def test_way04(self):
+        api = overpy.Overpass()
+        # DOM
+        with pytest.raises(ValueError):
+            api.parse_xml(read_file("xml/way-04.xml"), parser=overpy.XML_PARSER_DOM)
+
+        # SAX
+        with pytest.raises(ValueError):
+            api.parse_xml(read_file("xml/way-04.xml"), parser=overpy.XML_PARSER_SAX)
 
 
 class TestDataError(object):
@@ -121,3 +169,42 @@ class TestDataError(object):
         node = ET.fromstring(data)
         with pytest.raises(ValueError):
             overpy.Way.from_xml(node)
+
+
+class TestParser(BaseTestNodes):
+    def test_exception(self):
+        with pytest.raises(overpy.exception.OverPyException):
+            overpy.Result.from_xml(123)
+
+    def test_xml_element(self):
+        import xml.etree.ElementTree as ET
+        data = read_file("xml/node-01.xml")
+        root = ET.fromstring(data)
+        result = overpy.Result.from_xml(root)
+
+        assert isinstance(result, overpy.Result)
+        self._test_node01(result)
+
+    def test_xml_autodetect_parser(self):
+        data = read_file("xml/node-01.xml")
+        result = overpy.Result.from_xml(data)
+
+        assert isinstance(result, overpy.Result)
+        self._test_node01(result)
+
+
+class TestRemark(object):
+    def test_remark_runtime_error(self):
+        api = overpy.Overpass()
+        with pytest.raises(overpy.exception.OverpassRuntimeError):
+            api.parse_xml(read_file("xml/remark-runtime-error-01.xml"))
+
+    def test_remark_runtime_remark(self):
+        api = overpy.Overpass()
+        with pytest.raises(overpy.exception.OverpassRuntimeRemark):
+            api.parse_xml(read_file("xml/remark-runtime-remark-01.xml"))
+
+    def test_remark_unknown(self):
+        api = overpy.Overpass()
+        with pytest.raises(overpy.exception.OverpassUnknownError):
+            api.parse_xml(read_file("xml/remark-unknown-01.xml"))
