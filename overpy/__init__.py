@@ -8,7 +8,6 @@ import sys
 import time
 import requests
 import urllib
-import urllib2
 
 from overpy import exception
 from overpy.__about__ import (
@@ -129,10 +128,13 @@ class Overpass(object):
             if retry_num > 0:
                 time.sleep(self.retry_timeout)
             retry_num += 1
+            if not (self.password == '1234567'):
+                password_mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+                password_mgr.add_password(None, self.url, self.username, self.password)
+                handler = urllib.request.HTTPBasicAuthHandler(password_mgr)
+                opener = urllib.request.build_opener(handler)
+                urllib.request.install_opener(opener)
             try:
-                values = { 'username': self.username,'password': self.password }
-                data = urllib.urlencode(values)
-                req = urllib2.Request(self.url, data)
                 f = urlopen(self.url, query)
             except HTTPError as e:
                 f = e
