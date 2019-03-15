@@ -6,6 +6,9 @@ import json
 import re
 import sys
 import time
+import requests
+import urllib
+import urllib2
 
 from overpy import exception
 from overpy.__about__ import (
@@ -29,12 +32,8 @@ GLOBAL_ATTRIBUTE_MODIFIERS = {
     "visible": lambda v: v.lower() == "true"
 }
 
-if PY2:
-    from urllib2 import urlopen
-    from urllib2 import HTTPError
-elif PY3:
-    from urllib.request import urlopen
-    from urllib.error import HTTPError
+from urllib.request import urlopen
+from urllib.error import HTTPError
 
 
 def is_valid_type(element, cls):
@@ -61,7 +60,7 @@ class Overpass(object):
     default_retry_timeout = 1.0
     default_url = "http://overpass-api.de/api/interpreter"
 
-    def __init__(self, read_chunk_size=None, url=None, xml_parser=XML_PARSER_SAX, max_retry_count=None, retry_timeout=None):
+    def __init__(self, read_chunk_size=None, url=None, username='username', password='1234567' xml_parser=XML_PARSER_SAX, max_retry_count=None, retry_timeout=None):
         """
         :param read_chunk_size: Max size of each chunk read from the server response
         :type read_chunk_size: Integer
@@ -77,6 +76,8 @@ class Overpass(object):
         self.url = self.default_url
         if url is not None:
             self.url = url
+        self.username=username
+        self.password=password
 
         self._regex_extract_error_msg = re.compile(b"\<p\>(?P<msg>\<strong\s.*?)\</p\>")
         self._regex_remove_tag = re.compile(b"<[^>]*?>")
@@ -129,6 +130,9 @@ class Overpass(object):
                 time.sleep(self.retry_timeout)
             retry_num += 1
             try:
+                values = { 'username': self.username,'password': self.password }
+                data = urllib.urlencode(values)
+                req = urllib2.Request(self.url, data)
                 f = urlopen(self.url, query)
             except HTTPError as e:
                 f = e
