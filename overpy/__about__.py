@@ -9,7 +9,7 @@ __all__ = [
     "__version__",
 ]
 
-__title__ = "overpy"
+__title__ = "lpaar-overpy"
 __summary__ = "Python Wrapper to access the OpenStreepMap Overpass API"
 __uri__ = "https://github.com/DinoTools/python-overpy"
 
